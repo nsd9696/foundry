@@ -95,14 +95,20 @@ def _patch_init_torch_distributed() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
 
+        import torch
+        torch.cuda.set_device(self.tp_rank)
+
         rt.setup_graph_extension(
             self.server_args,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
             dp_rank=_resolve_dp_rank(self),
         )
+
         rt.log_alloc_offset("after_setup_graph_ext")
+
         result = orig(self, *args, **kwargs)
+
         rt.log_alloc_offset("after_init_torch_dist")
         rt.skip_to_scratch_boundary()
         rt.log_alloc_offset("after_scratch_skip")
@@ -179,9 +185,14 @@ def _patch_kernel_warmup() -> None:
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
-        # Phase 1 keeps pre-graph model-forward warmups out of SAVE/LOAD.
-        logger.info("[Foundry] SGLang kernel_warmup skipped in %s mode", mode.value)
-        return None
+        from foundry.allocation_region import stop_allocation_region, resume_allocation_region
+        logger.info("[Foundry] SGLang kernel_warmup running with VMM paused in %s mode", mode.value)
+        stop_allocation_region()
+        try:
+            result = orig(self, *args, **kwargs)
+        finally:
+            resume_allocation_region()
+        return result
 
     cls.kernel_warmup = patched
 
@@ -232,7 +243,16 @@ def _patch_cuda_graph_capture() -> None:
             def warmup_skipping_forward(*args, **kwargs):
                 counter[0] += 1
                 if counter[0] <= 2:
-                    return None
+                    import torch
+                    from foundry.allocation_region import stop_allocation_region, resume_allocation_region
+                    stop_allocation_region()
+                    try:
+                        result = real_forward(*args, **kwargs)
+                    finally:
+                        resume_allocation_region()
+                    if counter[0] == 2:
+                        torch.cuda.empty_cache()
+                    return result
                 return real_forward(*args, **kwargs)
 
             forward = warmup_skipping_forward

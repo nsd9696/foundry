@@ -140,7 +140,7 @@ def start_graph_builds() -> None:
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=1)
     _pending_graph_builds = (pending, graph_files)
     logger.info(
         "[Foundry] Started SGLang graph builds for %d graphs in %.3fs",
@@ -242,8 +242,14 @@ def load_all_graphs(cuda_graph_runner) -> None:
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    results = FoundryCUDAGraph.finish_graph_loads(pending)
+    # Load graphs synchronously one by one to avoid multi-threaded
+    # CUDA context issues in TP mode. start_graph_builds spawns
+    # background threads that don't inherit the correct GPU context.
+    results = []
+    for path in paths:
+        pending = FoundryCUDAGraph.start_graph_builds([path], num_threads=1)
+        result = FoundryCUDAGraph.finish_graph_loads(pending)
+        results.extend(result)
     logger.info(
         "[Foundry] Loaded %d SGLang graphs in %.3fs",
         len(results),

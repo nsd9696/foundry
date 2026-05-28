@@ -135,7 +135,9 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
 
     region_size = parse_size(cfg.region_size)
     cge.set_allocation_region(cfg.base_addr, region_size)
-    _ = torch._C._cuda_getCurrentBlasHandle()
+    # NOTE: cuBLAS handle init commented out for TP compatibility.
+    # vLLM integration also skips this (workspace init in graph capture).
+    # _ = torch._C._cuda_getCurrentBlasHandle()
     _state = CUDAGraphExtensionState(rank=rank)
     logger.info(
         "[Foundry] SGLang graph extension setup completed in %.3f s",
