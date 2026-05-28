@@ -185,13 +185,12 @@ def _patch_kernel_warmup() -> None:
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
-        from foundry.allocation_region import stop_allocation_region, resume_allocation_region
-        logger.info("[Foundry] SGLang kernel_warmup running with VMM paused in %s mode", mode.value)
-        stop_allocation_region()
-        try:
-            result = orig(self, *args, **kwargs)
-        finally:
-            resume_allocation_region()
+        # Run kernel_warmup with VMM ACTIVE so persistent buffers
+        # (DeepGEMM workspaces, MoE dispatch buffers) land in VMM.
+        # This is safe because kernel_warmup runs OUTSIDE graph capture
+        # (no cudaStreamCapture, so synchronize() is allowed).
+        logger.info("[Foundry] SGLang kernel_warmup running with VMM active in %s mode", mode.value)
+        result = orig(self, *args, **kwargs)
         return result
 
     cls.kernel_warmup = patched
@@ -245,12 +244,19 @@ def _patch_cuda_graph_capture() -> None:
                 if counter[0] <= 2:
                     import torch
                     from foundry.allocation_region import stop_allocation_region, resume_allocation_region
+                    # Run warmup in a separate MemPool so cached blocks
+                    # from standard allocator don't leak into VMM capture.
                     stop_allocation_region()
-                    try:
-                        result = real_forward(*args, **kwargs)
-                    finally:
-                        resume_allocation_region()
+                    warmup_pool = torch.cuda.memory.MemPool()
+                    with torch.cuda.use_mem_pool(warmup_pool):
+                        try:
+                            result = real_forward(*args, **kwargs)
+                        finally:
+                            pass
+                    resume_allocation_region()
                     if counter[0] == 2:
+                        # Delete warmup pool to free all its blocks
+                        del warmup_pool
                         torch.cuda.empty_cache()
                     return result
                 return real_forward(*args, **kwargs)
@@ -323,6 +329,12 @@ def _patch_cuda_graph_capture() -> None:
             # uses. Cursor advances by sum-of-int_workspace sizes.
             initialize_all_attention_metadata(self)
             rt.log_alloc_offset("save_after_pre_init")
+
+            # Flush all cached blocks from non-VMM allocations
+            # (kernel_warmup, NCCL init side effects, etc.) so that
+            # graph capture only uses VMM-backed allocations.
+            import torch
+            torch.cuda.empty_cache()
 
             # Drop the pre-pass's last forward_metadata reference so
             # that bs's wrapper isn't kept alive by it — otherwise
