@@ -12,6 +12,9 @@ from typing import Any
 
 import torch
 
+import json
+import struct
+
 import foundry as foundry_pkg
 from foundry import ops as cge
 from foundry.graph import CUDAGraph as FoundryCUDAGraph
@@ -66,6 +69,183 @@ def _unpack_output(tensors: Any) -> Any:
             raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
         tensors = tensors[0]
     return LogitsProcessorOutput(next_token_logits=tensors)
+
+
+def _grant_all_device_access_on_scratch(cfg) -> None:
+    """Grant all-device cuMemSetAccess on the VMM scratch region.
+
+    Binary-patched non-VMM addresses point to VMM scratch (base + 1GB).
+    For EP all-to-all, other GPUs need P2P access to this address.
+    The default cuMemSetAccess in Foundry's hook only grants local device.
+    """
+    import ctypes
+    from foundry.allocation_region import parse_size
+
+    scratch_addr = cfg.base_addr + parse_size(cfg.scratch_space_size)
+    scratch_size = 2 * 1024 * 1024  # 2MB granularity
+
+    libcuda = ctypes.CDLL("libcuda.so.1")
+
+    # Get device count
+    dev_count = ctypes.c_int(0)
+    libcuda.cuDeviceGetCount(ctypes.byref(dev_count))
+    dc = dev_count.value
+    if dc <= 1:
+        return
+
+    class CUmemAccessDesc(ctypes.Structure):
+        _fields_ = [
+            ("location_type", ctypes.c_uint),
+            ("location_id", ctypes.c_int),
+            ("flags", ctypes.c_uint),
+        ]
+
+    descs = (CUmemAccessDesc * dc)()
+    for i in range(dc):
+        descs[i].location_type = 1  # CU_MEM_LOCATION_TYPE_DEVICE
+        descs[i].location_id = i
+        descs[i].flags = 3  # CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+
+    ret = libcuda.cuMemSetAccess(scratch_addr, scratch_size, descs, dc)
+    if ret == 0:
+        logger.info("[Foundry] Granted all-device access on VMM scratch 0x%x (%d devices)", scratch_addr, dc)
+    else:
+        logger.warning("[Foundry] cuMemSetAccess all-device failed (error %d)", ret)
+
+
+def _premap_non_vmm_addresses(cfg, graph_files) -> None:
+    """Pre-map non-VMM addresses found in graph archives.
+
+    During SAVE with NCCL stop/resume, some buffers (e.g., MoE expert
+    dispatch) are allocated via standard allocator at non-VMM addresses.
+    During LOAD, these addresses don't exist. This function uses CUDA
+    driver API to reserve + map memory at those exact addresses so
+    graph kernel nodes can reference them.
+    """
+    import ctypes
+    from foundry.allocation_region import parse_size
+
+    vmm_base = cfg.base_addr
+    vmm_end = vmm_base + parse_size(cfg.region_size)
+
+    # Collect unique non-VMM addresses from all graph JSONs
+    non_vmm_addrs = set()
+    for _, filename, _ in graph_files:
+        jpath = os.path.join(cfg.workspace_dir, filename)
+        with open(jpath) as f:
+            g = json.load(f)
+        for n in g["nodes"]:
+            if n["type"] == "MemsetNode":
+                dst = n["params"]["dst"]
+                if dst < vmm_base or dst >= vmm_end:
+                    non_vmm_addrs.add(dst)
+
+        # Also scan the binary for non-VMM kernel parameter addresses
+        # by finding unique addresses that appear in the binary but
+        # aren't in VMM. The memset dst is the canonical one.
+
+    if not non_vmm_addrs:
+        return
+
+    # Use CUDA driver API to map memory at each non-VMM address
+    libcuda = ctypes.CDLL("libcuda.so.1")
+
+    CU_SUCCESS = 0
+    CU_MEM_ALLOCATION_TYPE_PINNED = 1
+    CU_MEM_LOCATION_TYPE_DEVICE = 1
+    CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+    CU_MEM_HANDLE_TYPE_NONE = 0
+
+    # We need at least 2MB aligned for VMM operations
+    ALLOC_ALIGNMENT = 2 * 1024 * 1024
+
+    # Get current device
+    device = ctypes.c_int(0)
+    libcuda.cuCtxGetDevice(ctypes.byref(device))
+
+    # Get allocation granularity
+    granularity = ctypes.c_size_t(0)
+
+    class CUmemAllocationProp(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_uint),
+            ("requestedHandleTypes", ctypes.c_uint),
+            ("location_type", ctypes.c_uint),
+            ("location_id", ctypes.c_int),
+            ("win32HandleMetaData", ctypes.c_void_p),
+            ("allocFlags", ctypes.c_ulonglong),
+        ]
+
+    prop = CUmemAllocationProp()
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location_type = CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location_id = device.value
+
+    libcuda.cuMemGetAllocationGranularity(
+        ctypes.byref(granularity), ctypes.byref(prop), 1  # CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+    )
+    gran = granularity.value or ALLOC_ALIGNMENT
+
+    for addr in sorted(non_vmm_addrs):
+        # Align address down to granularity
+        aligned_addr = (addr // gran) * gran
+        alloc_size = gran  # Allocate one granularity unit
+
+        # Reserve the virtual address
+        reserved = ctypes.c_ulonglong(0)
+        ret = libcuda.cuMemAddressReserve(
+            ctypes.byref(reserved), alloc_size, gran, aligned_addr, 0
+        )
+        if ret != CU_SUCCESS:
+            logger.warning(
+                "[Foundry] Failed to reserve 0x%x (error %d), skipping", aligned_addr, ret
+            )
+            continue
+
+        if reserved.value != aligned_addr:
+            logger.warning(
+                "[Foundry] Reserved at 0x%x != requested 0x%x", reserved.value, aligned_addr
+            )
+            libcuda.cuMemAddressFree(reserved, alloc_size)
+            continue
+
+        # Create physical memory
+        handle = ctypes.c_ulonglong(0)
+        ret = libcuda.cuMemCreate(ctypes.byref(handle), alloc_size, ctypes.byref(prop), 0)
+        if ret != CU_SUCCESS:
+            logger.warning("[Foundry] cuMemCreate failed (error %d)", ret)
+            libcuda.cuMemAddressFree(reserved, alloc_size)
+            continue
+
+        # Map physical memory at the reserved address
+        ret = libcuda.cuMemMap(aligned_addr, alloc_size, 0, handle, 0)
+        if ret != CU_SUCCESS:
+            logger.warning("[Foundry] cuMemMap failed at 0x%x (error %d)", aligned_addr, ret)
+            libcuda.cuMemRelease(handle)
+            libcuda.cuMemAddressFree(reserved, alloc_size)
+            continue
+
+        # Set access for current device
+        class CUmemAccessDesc(ctypes.Structure):
+            _fields_ = [
+                ("location_type", ctypes.c_uint),
+                ("location_id", ctypes.c_int),
+                ("flags", ctypes.c_uint),
+            ]
+
+        access = CUmemAccessDesc()
+        access.location_type = CU_MEM_LOCATION_TYPE_DEVICE
+        access.location_id = device.value
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+
+        ret = libcuda.cuMemSetAccess(aligned_addr, alloc_size, ctypes.byref(access), 1)
+        if ret != CU_SUCCESS:
+            logger.warning("[Foundry] cuMemSetAccess failed (error %d)", ret)
+
+        logger.info(
+            "[Foundry] Pre-mapped non-VMM address 0x%x (%d bytes) for graph LOAD",
+            aligned_addr, alloc_size,
+        )
 
 
 def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -239,6 +419,11 @@ def load_all_graphs(cuda_graph_runner) -> None:
     # NVSHMEM symbols. Single-GPU dense models have 0 NVSHMEM modules, so
     # this is a no-op there but kept for EP parity.
     cge.init_nvshmem_for_loaded_modules()
+
+    # Grant all-device access on VMM scratch region so binary-patched
+    # non-VMM addresses (redirected to VMM scratch) can be accessed
+    # by all GPUs during EP all-to-all graph replay.
+    _grant_all_device_access_on_scratch(cfg)
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()

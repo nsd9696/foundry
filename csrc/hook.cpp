@@ -19,6 +19,9 @@
 #include <fstream>
 #include <vector>
 #include <string_view>
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/filesystem.hpp>
@@ -2907,16 +2910,25 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
     // - File descriptor (4 bytes)
     // - Original pointer address (8 bytes) - critical for CUDA graph replay!
     // - Size (8 bytes)
+    // - Source PID (4 bytes) - for cross-process fd access via /proc/PID/fd/
     memset(pHandle, 0, sizeof(CUipcMemHandle));
 
+    pid_t src_pid = getpid();
+    // Allow other processes (same user) to access our fds via pidfd_getfd
+    static bool ptracer_set = false;
+    if (!ptracer_set) {
+      prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+      ptracer_set = true;
+    }
     memcpy(pHandle->reserved, &VMM_IPC_MAGIC, sizeof(uint32_t));
     memcpy(pHandle->reserved + 4, &fd, sizeof(int));
     memcpy(pHandle->reserved + 8, &dptr, sizeof(CUdeviceptr));
     memcpy(pHandle->reserved + 16, &metadata.size, sizeof(size_t));
+    memcpy(pHandle->reserved + 24, &src_pid, sizeof(pid_t));
 
 #ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d, size=%zu\n",
-            (unsigned long long)dptr, fd, metadata.size);
+    fprintf(stderr, "[HOOK] cuIpcGetMemHandle: VMM ptr=0x%llx, fd=%d, pid=%d, size=%zu\n",
+            (unsigned long long)dptr, fd, src_pid, metadata.size);
 #endif
     return CUDA_SUCCESS;
   }
@@ -2940,17 +2952,50 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
 
   if (magic == VMM_IPC_MAGIC) {
     // This is a VMM IPC handle - extract the packed data
-    int fd;
+    int remote_fd;
     CUdeviceptr original_ptr;
     size_t size;
+    pid_t src_pid = 0;
 
-    memcpy(&fd, handle.reserved + 4, sizeof(int));
+    memcpy(&remote_fd, handle.reserved + 4, sizeof(int));
     memcpy(&original_ptr, handle.reserved + 8, sizeof(CUdeviceptr));
     memcpy(&size, handle.reserved + 16, sizeof(size_t));
+    memcpy(&src_pid, handle.reserved + 24, sizeof(pid_t));
+
+    // If this is a cross-process IPC, open the fd via /proc/PID/fd/
+    // This works because POSIX fd for VMM shareable handles refers to
+    // a kernel dmabuf object accessible via procfs.
+    int local_fd = remote_fd;
+    pid_t my_pid = getpid();
+    bool cross_process = (src_pid != 0 && src_pid != my_pid);
+
+    if (cross_process) {
+      // Use pidfd_getfd() syscall to properly duplicate the remote fd.
+      // This preserves dmabuf semantics, unlike open(/proc/PID/fd/N).
+      // pidfd_open() returns a pidfd, then pidfd_getfd() duplicates
+      // the target fd into our process.
+      int pidfd = syscall(SYS_pidfd_open, src_pid, 0);
+      if (pidfd < 0) {
+        fprintf(stderr, "[HOOK] ERROR: pidfd_open(%d) failed (errno=%d)\n", (int)src_pid, errno);
+        if (real_func) return real_func(pdptr, handle, Flags);
+        return CUDA_ERROR_NOT_SUPPORTED;
+      }
+      local_fd = syscall(SYS_pidfd_getfd, pidfd, remote_fd, 0);
+      close(pidfd);
+      if (local_fd < 0) {
+        fprintf(stderr, "[HOOK] ERROR: pidfd_getfd(pid=%d, fd=%d) failed (errno=%d)\n",
+                (int)src_pid, remote_fd, errno);
+        if (real_func) return real_func(pdptr, handle, Flags);
+        return CUDA_ERROR_NOT_SUPPORTED;
+      }
+      fprintf(stderr,
+              "[HOOK] cuIpcOpenMemHandle: pidfd_getfd(pid=%d, fd=%d) -> local_fd=%d\n",
+              (int)src_pid, remote_fd, local_fd);
+    }
 
 #ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: VMM fd=%d, original_ptr=0x%llx, size=%zu\n", fd,
-            (unsigned long long)original_ptr, size);
+    fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: VMM fd=%d (local=%d), original_ptr=0x%llx, size=%zu, src_pid=%d\n",
+            remote_fd, local_fd, (unsigned long long)original_ptr, size, (int)src_pid);
 #endif
 
     // Import the allocation handle from file descriptor
@@ -2961,12 +3006,18 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
 
     if (import_func == nullptr) {
       fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle not found\n");
+      if (cross_process) close(local_fd);
       return CUDA_ERROR_NOT_SUPPORTED;
     }
 
     CUmemGenericAllocationHandle imported_handle;
-    CUresult result = import_func(&imported_handle, (void*)(intptr_t)fd,
+    CUresult result = import_func(&imported_handle, (void*)(intptr_t)local_fd,
                                   CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+
+    // Close the local copy of the fd (import duplicates internally)
+    if (cross_process) {
+      close(local_fd);
+    }
 
     if (result != CUDA_SUCCESS) {
       fprintf(stderr, "[HOOK] ERROR: cuMemImportFromShareableHandle failed with error %d\n",
@@ -2974,20 +3025,43 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
       return result;
     }
 
-    // Map to the SAME address as original (critical for CUDA graph replay!)
+    // Map to a NEW address (not original_ptr) because in multi-GPU setups
+    // each process uses the same VMM base_addr, so original_ptr is occupied.
+    // Reserve a new address, map, and return the new pointer.
+    // NCCL doesn't need the same address - it just needs a valid pointer.
+
+    size_t granularity = kAllocAlignment;  // 2MB
+
+    size_t aligned_size = ((size + granularity - 1) / granularity) * granularity;
+
+    // Reserve a new address for this IPC mapping
+    typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long);
+    auto reserve_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(
+        cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressReserve);
+
+    CUdeviceptr mapped_ptr = 0;
+    result = reserve_func(&mapped_ptr, aligned_size, granularity, 0, 0);  // 0 = let driver choose
+    if (result != CUDA_SUCCESS) {
+      fprintf(stderr, "[HOOK] ERROR: cuMemAddressReserve for IPC failed with error %d\n", result);
+      return result;
+    }
+
     typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
                                    unsigned long long);
     auto map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
 
-    result = map_func(original_ptr, size, 0, imported_handle, 0);
+    result = map_func(mapped_ptr, aligned_size, 0, imported_handle, 0);
     if (result != CUDA_SUCCESS) {
       fprintf(stderr,
               "[HOOK] ERROR: cuMemMap for IPC failed with error %d at addr=0x%llx size=%zu\n",
-              result, (unsigned long long)original_ptr, size);
+              result, (unsigned long long)mapped_ptr, aligned_size);
+      typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
+      auto free_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressFree);
+      free_func(mapped_ptr, aligned_size);
       return result;
     }
 
-    // Set access permissions
+    // Set access permissions for current device
     CUdevice device;
     typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
     auto get_device_func =
@@ -3003,13 +3077,15 @@ CUresult cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned 
     auto set_access_func =
         (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
 
-    result = set_access_func(original_ptr, size, &accessDesc, 1);
+    result = set_access_func(mapped_ptr, aligned_size, &accessDesc, 1);
     if (result != CUDA_SUCCESS) {
       fprintf(stderr, "[HOOK] ERROR: cuMemSetAccess for IPC failed with error %d\n", result);
       return result;
     }
 
-    *pdptr = original_ptr;
+    *pdptr = mapped_ptr;
+    fprintf(stderr, "[HOOK] cuIpcOpenMemHandle: mapped at 0x%llx (original was 0x%llx), size=%zu\n",
+            (unsigned long long)mapped_ptr, (unsigned long long)original_ptr, size);
 
     // Track this imported allocation
     AllocMetadata alloc_metadata;
