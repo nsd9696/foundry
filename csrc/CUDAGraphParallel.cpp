@@ -1915,6 +1915,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
         on_demand_futures.push_back(
             pool.submit([&all_parsed, &graph_names, &bin_files, main_ctx, i]() {
+              // Push main CUDA context for driver calls in worker thread
+              // (cuFuncSetAttribute, cuEventCreate need valid context)
+              cuCtxSetCurrent(main_ctx);
               if (bin_files[i].valid()) {
                 // Binary-native path: direct struct reads, no JSON
                 CUDAGraph::prepare_on_demand_graph_binary(bin_files[i], all_parsed[i].graph,

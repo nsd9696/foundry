@@ -320,7 +320,7 @@ def start_graph_builds() -> None:
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=1)
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
     _pending_graph_builds = (pending, graph_files)
     logger.info(
         "[Foundry] Started SGLang graph builds for %d graphs in %.3fs",
@@ -420,21 +420,18 @@ def load_all_graphs(cuda_graph_runner) -> None:
     # this is a no-op there but kept for EP parity.
     cge.init_nvshmem_for_loaded_modules()
 
-    # Grant all-device access on VMM scratch region so binary-patched
-    # non-VMM addresses (redirected to VMM scratch) can be accessed
-    # by all GPUs during EP all-to-all graph replay.
-    _grant_all_device_access_on_scratch(cfg)
+    # All-device access is handled by the C++ hook (cuMemSetAccess
+    # grants access to all GPUs at allocation time).
+    # _grant_all_device_access_on_scratch(cfg)
 
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
-    # Load graphs synchronously one by one to avoid multi-threaded
-    # CUDA context issues in TP mode. start_graph_builds spawns
-    # background threads that don't inherit the correct GPU context.
-    results = []
-    for path in paths:
-        pending = FoundryCUDAGraph.start_graph_builds([path], num_threads=1)
-        result = FoundryCUDAGraph.finish_graph_loads(pending)
-        results.extend(result)
+    # All graphs in one shot — required for template/on-demand linking
+    # in graph_manifest.json (see memory-consistency.md Bug 4).
+    # num_threads=4 for template build parallelism. The bg_thread
+    # explicitly sets cuCtxSetCurrent(main_ctx) (CUDAGraphParallel.cpp:1897).
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    results = FoundryCUDAGraph.finish_graph_loads(pending)
     logger.info(
         "[Foundry] Loaded %d SGLang graphs in %.3fs",
         len(results),

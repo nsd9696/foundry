@@ -29,8 +29,8 @@ import sys
 
 def parse_size(s: str) -> int:
     s = s.strip().upper()
-    units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
-    for suffix, mult in units.items():
+    units = [("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)]
+    for suffix, mult in units:
         if s.endswith(suffix):
             return int(float(s[: -len(suffix)]) * mult)
     return int(s)

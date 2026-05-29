@@ -76,7 +76,6 @@ def install_hooks(server_args) -> None:
     _patch_init_memory_pool()
     _patch_load_model()
     _patch_kernel_warmup()
-    _patch_deepgemm_sync()
     _patch_cuda_graph_capture()
     _patch_spawn_sites()
 
@@ -108,8 +107,6 @@ def _patch_init_torch_distributed() -> None:
 
         rt.log_alloc_offset("after_setup_graph_ext")
 
-        # VMM stays active during NCCL init.
-        # Cross-process VMM IPC is handled by pidfd_getfd in hook.cpp.
         result = orig(self, *args, **kwargs)
 
         rt.log_alloc_offset("after_init_torch_dist")
@@ -192,20 +189,16 @@ def _patch_deepgemm_sync() -> None:
     if not hasattr(dg_compile, '_compile_deep_gemm_one_type_all'):
         return
 
-    orig_maybe_compile = dg_compile._maybe_compile_deep_gemm_one_type_all
-
-    # Track whether we're inside graph capture
-    _in_capture = [False]
-
     orig_compile_all = dg_compile._compile_deep_gemm_one_type_all
+    _in_capture = [False]
 
     @functools.wraps(orig_compile_all)
     def patched_compile_all(*args, **kwargs):
         if _in_capture[0]:
-            # During graph capture, skip synchronize() only.
-            # Keep VMM active so JIT allocations are recorded as
-            # alloc events and replayed deterministically on LOAD.
-            # (vLLM pattern: JIT runs inside capture, gets recorded)
+            # ONLY during graph capture: skip synchronize.
+            # Outside capture (kernel_warmup), sync runs normally
+            # so DeepGEMM warmup benchmarks get correct results
+            # for kernel selection.
             import torch
             orig_sync = torch.cuda.Stream.synchronize
             torch.cuda.Stream.synchronize = lambda self: None
@@ -216,10 +209,8 @@ def _patch_deepgemm_sync() -> None:
         return orig_compile_all(*args, **kwargs)
 
     dg_compile._compile_deep_gemm_one_type_all = patched_compile_all
-
-    # Expose capture flag for _patch_cuda_graph_capture to set
     dg_compile._foundry_in_capture = _in_capture
-    logger.info("[Foundry] DeepGEMM sync patched for graph capture")
+    logger.info("[Foundry] DeepGEMM synchronize patched (capture-only no-op)")
 
 
 def _patch_kernel_warmup() -> None:
@@ -233,11 +224,18 @@ def _patch_kernel_warmup() -> None:
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
-        # Skip kernel_warmup. DeepGEMM JIT runs during graph capture
-        # with sync no-op (_patch_deepgemm_sync). Alloc events are
-        # recorded and replayed deterministically on LOAD.
-        logger.info("[Foundry] SGLang kernel_warmup skipped in %s mode", mode.value)
-        return None
+        # Run kernel_warmup with VMM stopped to pre-compile DeepGEMM.
+        # Also force-compile any shapes that kernel_warmup misses.
+        from foundry.allocation_region import stop_allocation_region, resume_allocation_region
+        logger.info("[Foundry] SGLang kernel_warmup with VMM paused in %s mode", mode.value)
+        stop_allocation_region()
+        try:
+            result = orig(self, *args, **kwargs)
+        finally:
+            resume_allocation_region()
+        import torch
+        torch.cuda.empty_cache()
+        return result
 
     cls.kernel_warmup = patched
 
@@ -273,13 +271,6 @@ def _patch_cuda_graph_capture() -> None:
     def patched_capture_one_batch_size(self, bs, forward, stream_idx=None):
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.SAVE:
-            # Set DeepGEMM capture flag
-            try:
-                from sglang.srt.layers.deep_gemm_wrapper import compile_utils as dg_compile
-                if hasattr(dg_compile, '_foundry_in_capture'):
-                    dg_compile._foundry_in_capture[0] = True
-            except ImportError:
-                pass
             # Suppress the two pre-capture warmup forwards
             # (cuda_graph_runner.py: ``for _ in range(2): run_once()``).
             # Their non-deterministic activation allocations would pollute
@@ -295,20 +286,25 @@ def _patch_cuda_graph_capture() -> None:
             def warmup_skipping_forward(*args, **kwargs):
                 counter[0] += 1
                 if counter[0] <= 2:
-                    return None
+                    # Run warmup WITH VMM stopped to pre-compile
+                    # DeepGEMM (sync works normally outside capture).
+                    import torch
+                    from foundry.allocation_region import stop_allocation_region, resume_allocation_region
+                    stop_allocation_region()
+                    try:
+                        result = real_forward(*args, **kwargs)
+                    finally:
+                        resume_allocation_region()
+                    if counter[0] == 2:
+                        torch.cuda.empty_cache()
+                    return result
                 return real_forward(*args, **kwargs)
 
             forward = warmup_skipping_forward
         try:
             graph, output = orig_capture_one_batch_size(self, bs, forward, stream_idx)
         finally:
-            # Clear DeepGEMM capture flag
-            try:
-                from sglang.srt.layers.deep_gemm_wrapper import compile_utils as dg_compile
-                if hasattr(dg_compile, '_foundry_in_capture'):
-                    dg_compile._foundry_in_capture[0] = False
-            except ImportError:
-                pass
+            pass
         if mode == CUDAGraphExtensionMode.SAVE:
             from foundry.integration.sglang.graph_ops import save_graph
 
@@ -375,16 +371,23 @@ def _patch_cuda_graph_capture() -> None:
             )
 
             rt.log_alloc_offset("save_before_pre_init")
-            # Pre-pass: allocate every per-bs FlashInfer wrapper up
-            # front, in the same ``reversed(capture_bs)`` order LOAD
-            # uses. Cursor advances by sum-of-int_workspace sizes.
-            initialize_all_attention_metadata(self)
+
+            # Check if EP mode — skip pre-pass + reuse wrapper for EP.
+            # The reuse_pre_pass_init wrapper corrupts EP attention
+            # metadata because EP's expert routing changes the KV
+            # layout per-batch-size in ways the pre-pass can't predict.
+            import os
+            _ep_size = int(os.environ.get("EP_SIZE", getattr(self, '_ep_size', 1)))
+            try:
+                _ep_size = self.model_runner.server_args.ep_size
+            except Exception:
+                pass
+
+            if _ep_size <= 1:
+                # TP-only: pre-pass + reuse (original Foundry logic)
+                initialize_all_attention_metadata(self)
             rt.log_alloc_offset("save_after_pre_init")
 
-            # Drop the pre-pass's last forward_metadata reference so
-            # that bs's wrapper isn't kept alive by it — otherwise
-            # popping the dict entry below leaves a refcount of 1 and
-            # the inner init's reallocation can't reuse the segment.
             attn_backend = self.attn_backend
             attn_backend.forward_metadata = None
 
@@ -489,7 +492,9 @@ def _patch_cuda_graph_capture() -> None:
                     spec_info,
                 )
 
-            attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
+            if _ep_size <= 1:
+                # TP-only: use reuse wrapper
+                attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
             try:
                 result = orig_capture(self, *args, **kwargs)
             finally:
@@ -504,12 +509,6 @@ def _patch_cuda_graph_capture() -> None:
             pack_fatbins()
             rt.capture_final_alloc_offset()
 
-            # Post-capture: stop VMM so inference allocations use
-            # standard allocator (vLLM pattern). This prevents
-            # post-capture allocs from advancing the VMM cursor.
-            from foundry.allocation_region import stop_allocation_region
-            stop_allocation_region()
-            logger.info("[Foundry] Stopped VMM after graph capture (SAVE)")
             return result
 
         return orig_capture(self, *args, **kwargs)
