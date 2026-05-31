@@ -645,9 +645,19 @@ def _load_piecewise_graphs_skip_compile(model_runner) -> None:
         time.perf_counter() - t0,
     )
 
-    # Use the runner that was already created by init_piecewise_cuda_graphs
-    # (with mocked compile/capture). It has proper buffers and attributes.
-    runner = model_runner.piecewise_cuda_graph_runner
+    # Use existing runner if available, or create a stub
+    runner = getattr(model_runner, "piecewise_cuda_graph_runner", None)
+    if runner is None:
+        # torch.compile was skipped — create minimal stub for can_run
+        class _StubRunner:
+            max_num_tokens = max(batch_sizes) if batch_sizes else 0
+            capture_num_tokens = sorted(batch_sizes)
+            def can_run(self, forward_batch):
+                return len(forward_batch.input_ids) <= self.max_num_tokens
+            def replay(self, forward_batch, **kwargs):
+                pass  # Handled by _replay_forward
+        runner = _StubRunner()
+        model_runner.piecewise_cuda_graph_runner = runner
 
     # Install replay wrapper on model.forward
     original_forward = model_runner.model.forward
@@ -662,15 +672,12 @@ def _load_piecewise_graphs_skip_compile(model_runner) -> None:
             _loaded_batch_sizes.add(int(parts[2]))
 
     # Override can_run to reject batch sizes without loaded graphs
-    _orig_can_run = type(runner).can_run
-
+    # Override can_run: only allow batch sizes that have loaded graphs
     def _patched_can_run(self, forward_batch):
-        if not _orig_can_run(self, forward_batch):
-            return False
         num_tokens = len(forward_batch.input_ids)
-        return num_tokens in _loaded_batch_sizes
+        return num_tokens in _loaded_batch_sizes and num_tokens <= self.max_num_tokens
 
-    type(runner).can_run = _patched_can_run
+    runner.can_run = _patched_can_run.__get__(runner)
 
     def _replay_forward(input_ids, positions, forward_batch, **kwargs):
         num_tokens = input_ids.shape[0]
@@ -840,13 +847,33 @@ def _patch_init_device_graphs_ep() -> None:
                         fb.input_ids, fb.positions, fb,
                     )
 
-            with ExitStack() as stack:
-                stack.enter_context(mock_patch.object(_PCGRunner, "capture", lambda self: None))
-                # Let EVERYTHING run except capture. torch.compile +
-                # warmup_compile execute identically to SAVE, ensuring
-                # the same VMM allocation trajectory. Only capture() is
-                # skipped (replaced with graph load).
-                orig_pw(self, *args, **kwargs)
+            # Try skip torch.compile: preallocate VMM to cover the cursor
+            # range that SAVE's torch.compile + warmup occupied.
+            import os, json as _jm
+            from foundry import ops as _cge
+            cfg = rt.get_config()
+            cursor_range_path = os.path.join(cfg.workspace_dir, "piecewise_cursor_range.json")
+            if os.path.exists(cursor_range_path):
+                with open(cursor_range_path) as f:
+                    cr = _jm.load(f)
+                current = _cge.get_current_alloc_offset()
+                needed = cr["cursor_after"] - current
+                if needed > 0:
+                    import time as _time
+                    t0 = _time.perf_counter()
+                    _cge.preallocate_region(needed)
+                    after = _cge.get_current_alloc_offset()
+                    logger.info("[Foundry] Preallocated %d bytes (%.1f MB) in %.3fs (torch.compile skipped)",
+                                needed, needed / 1024 / 1024, _time.perf_counter() - t0)
+                else:
+                    logger.info("[Foundry] No preallocation needed (cursor already past)")
+                self.piecewise_cuda_graph_runner = None
+            else:
+                # Fallback: run torch.compile normally
+                logger.warning("[Foundry] No cursor range file, running torch.compile")
+                with ExitStack() as stack:
+                    stack.enter_context(mock_patch.object(_PCGRunner, "capture", lambda self: None))
+                    orig_pw(self, *args, **kwargs)
 
             # Now model_runner has attention_layers, moe_layers, and
             # piecewise_cuda_graph_runner with proper buffers.
@@ -858,10 +885,21 @@ def _patch_init_device_graphs_ep() -> None:
             return
 
         if mode == CUDAGraphExtensionMode.SAVE:
-            # Let EVERYTHING run: warmup_compile + install_torch_compiled.
-            # torch.compile creates the same allocation trajectory as LOAD.
-            # Only capture is replaced with merged warmup+capture in patched_call.
+            # Record VMM cursor before/after piecewise init. LOAD can use
+            # this to preallocate the VMM region without running torch.compile.
+            import os, json as _jm
+            from foundry import ops as _cge
+            cfg = rt.get_config()
+            cursor_before = _cge.get_current_alloc_offset()
             result = orig_pw(self, *args, **kwargs)
+            cursor_after = _cge.get_current_alloc_offset()
+            if cfg and cfg.workspace_dir:
+                path = os.path.join(cfg.workspace_dir, "piecewise_cursor_range.json")
+                with open(path, "w") as f:
+                    _jm.dump({"cursor_before": cursor_before, "cursor_after": cursor_after}, f)
+                logger.info("[Foundry] Saved piecewise cursor range: %d → %d (%.1f MB)",
+                            cursor_before, cursor_after,
+                            (cursor_after - cursor_before) / 1024 / 1024)
         else:
             result = orig_pw(self, *args, **kwargs)
 

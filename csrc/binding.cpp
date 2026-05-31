@@ -86,6 +86,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Clear recorded VMM allocation events");
 
   m.def(
+      "save_hook_events_to_json",
+      []() {
+        auto events = ::foundry::save_hook_events_to_json();
+        return boost::json::serialize(events);
+      },
+      "Save recorded VMM allocation events as JSON string");
+
+  m.def(
+      "replay_hook_events_from_json",
+      [](const std::string& json_str) {
+        auto val = boost::json::parse(json_str);
+        ::foundry::replay_hook_events_from_json(val.as_object());
+      },
+      py::arg("events_json"),
+      "Replay VMM allocation events from JSON object (creates VMM segments)");
+
+  m.def(
       "pack_fatbins_to_folder",
       [](const std::string& folder_path) { ::foundry::pack_fatbins_to_folder(folder_path); },
       py::arg("folder_path"), "Pack all loaded fatbins/cubins to the specified folder");
