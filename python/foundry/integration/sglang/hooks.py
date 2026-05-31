@@ -595,45 +595,17 @@ def _load_piecewise_graphs_skip_compile(model_runner) -> None:
         logger.warning("[Foundry] No piecewise graph files found")
         return
 
-    # Pre-check which graphs have alloc events (only those can be replayed)
-    import json as _json
-    valid_entries = []
-    skipped_no_events = 0
-    for cap_idx, key, filepath, meta in entries:
-        with open(filepath.replace(".cugraph", ".json").replace(filepath.split("/")[-1],
-                  filepath.split("/")[-1].replace(".cugraph", ""))) as f:
-            pass  # Just checking existence
-        # Read the JSON to check alloc events
-        json_path = filepath.replace(".cugraph", ".json") if filepath.endswith(".cugraph") else filepath
-        # Actually the filepath is already the JSON path from _graph_filename
-        try:
-            with open(filepath) as f:
-                gj = _json.load(f)
-            ae = gj.get("allocator_events", {})
-            n_events = len(ae.get("events", []))
-        except Exception:
-            n_events = 0
-        if n_events > 0:
-            valid_entries.append((cap_idx, key, filepath, meta))
-        else:
-            skipped_no_events += 1
-
-    logger.info("[Foundry] Piecewise graphs: %d with alloc events, %d skipped (no events)",
-                len(valid_entries), skipped_no_events)
-
-    # Build only graphs that have alloc events
-    paths = [e[2] for e in valid_entries]
-    if not paths:
-        logger.warning("[Foundry] No piecewise graphs with alloc events")
-        return
-
+    # Load ALL graphs — torch.compile runs identically on LOAD,
+    # so VMM segments are mapped at the same addresses as SAVE.
+    # Graphs with 0 alloc events access blocks within those segments.
+    paths = [e[2] for e in entries]
     pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=1)
 
     loaded = {}
     num_segments = 0
     batch_sizes = set()
     failed = 0
-    for i, (_, key, _, meta) in enumerate(valid_entries):
+    for i, (_, key, _, meta) in enumerate(entries):
         try:
             graph, loaded_tensors = FoundryCUDAGraph.finish_one_graph_load(pending, i)
         except RuntimeError as e:
