@@ -39,6 +39,7 @@ int init_nvshmem_for_loaded_modules();
 
 void start_hook_record();
 void end_hook_record();
+bool is_hook_recording();
 void clear_hook_events();
 boost::json::object save_hook_events_to_json();
 void replay_hook_events_from_json(const boost::json::object& events_obj);

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -47,7 +48,7 @@ def _graph_filename(index: int, key: Any) -> str:
     return f"graph_{index}_FULL_t{batch_size}_r{batch_size}_UX_pcN.json"
 
 
-def _pack_output(output: Any) -> torch.Tensor:
+def _pack_output(output: Any):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     if isinstance(output, LogitsProcessorOutput):
@@ -57,6 +58,13 @@ def _pack_output(output: Any) -> torch.Tensor:
 
     if isinstance(output, torch.Tensor):
         return output
+
+    # Piecewise segments may return tuple of tensors
+    if isinstance(output, (tuple, list)):
+        tensors = [t for t in output if isinstance(t, torch.Tensor)]
+        if len(tensors) == 1:
+            return tensors[0]
+        return tensors
 
     raise TypeError(f"Unsupported SGLang CUDA graph output type: {type(output)!r}")
 
@@ -441,3 +449,109 @@ def load_all_graphs(cuda_graph_runner) -> None:
     for i, (_index, _filename, meta) in enumerate(graph_files):
         graph, tensors = results[i]
         state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
+
+
+# ---------------------------------------------------------------------------
+# Piecewise graph LOAD pipeline
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PiecewisePendingBuilds:
+    pending: Any
+    key_to_index: dict
+    key_to_meta: dict
+
+
+_pending_piecewise_builds: _PiecewisePendingBuilds | None = None
+
+
+def start_piecewise_graph_builds() -> None:
+    """Read piecewise_key_map.json and kick off background builds for all
+    piecewise graphs in one shot (required for template/on-demand linking)."""
+    global _pending_piecewise_builds
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        raise RuntimeError("Foundry workspace_dir is not initialized")
+
+    map_path = os.path.join(cfg.workspace_dir, "piecewise_key_map.json")
+    if not os.path.exists(map_path):
+        logger.warning("[Foundry] No piecewise_key_map.json found, skipping piecewise LOAD")
+        return
+
+    with open(map_path) as f:
+        key_map = json.load(f)
+
+    entries = []
+    for key, info in key_map.items():
+        if isinstance(info, dict):
+            capture_idx = info["idx"]
+            meta = {"structure": info.get("structure"), "output_type": info.get("output_type", "tuple")}
+        else:
+            capture_idx = info
+            meta = {"structure": "tensor", "output_type": "tensor"}
+        filename = _graph_filename(capture_idx, key)
+        filepath = os.path.join(cfg.workspace_dir, filename)
+        if os.path.exists(filepath):
+            entries.append((capture_idx, key, filepath, meta))
+
+    if not entries:
+        logger.warning("[Foundry] No piecewise graph files found")
+        return
+
+    entries.sort(key=lambda x: x[0])
+
+    paths = [e[2] for e in entries]
+    key_to_index = {e[1]: i for i, e in enumerate(entries)}
+    key_to_meta = {e[1]: e[3] for e in entries}
+
+    t0 = time.perf_counter()
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    _pending_piecewise_builds = _PiecewisePendingBuilds(
+        pending=pending,
+        key_to_index=key_to_index,
+        key_to_meta=key_to_meta,
+    )
+    logger.info(
+        "[Foundry] Started piecewise graph builds for %d graphs in %.3fs",
+        len(paths), time.perf_counter() - t0,
+    )
+
+
+def finish_one_piecewise_graph_load(key: str):
+    """Finish loading one piecewise graph. Must be called in SAVE capture order.
+    Returns (graph, reconstructed_output)."""
+    if _pending_piecewise_builds is None:
+        raise RuntimeError(
+            f"finish_one_piecewise_graph_load({key}) called but no pending "
+            "builds — was start_piecewise_graph_builds() called first?"
+        )
+
+    index = _pending_piecewise_builds.key_to_index.get(key)
+    if index is None:
+        raise RuntimeError(f"Piecewise graph key not in pending builds: {key}")
+
+    meta = _pending_piecewise_builds.key_to_meta[key]
+    structure = meta["structure"]
+    output_type = meta.get("output_type", "tuple")
+
+    graph, loaded_tensors = FoundryCUDAGraph.finish_one_graph_load(
+        _pending_piecewise_builds.pending, index
+    )
+
+    if structure == "tensor":
+        reconstructed = loaded_tensors
+    elif isinstance(structure, list):
+        if not isinstance(loaded_tensors, (list, tuple)):
+            loaded_tensors = [loaded_tensors]
+        slots = []
+        for s in structure:
+            if s is not None:
+                slots.append(loaded_tensors[s])
+            else:
+                slots.append(None)
+        reconstructed = tuple(slots) if output_type == "tuple" else slots
+    else:
+        reconstructed = loaded_tensors
+
+    return graph, reconstructed

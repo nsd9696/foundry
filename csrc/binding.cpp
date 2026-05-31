@@ -73,6 +73,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "runtime is initialized (e.g., after DeepEP Buffer creation). Returns count of modules "
       "initialized.");
 
+  m.def("start_hook_record", &::foundry::start_hook_record,
+        "Start recording VMM allocation events (for piecewise warmup+capture)");
+
+  m.def("end_hook_record", &::foundry::end_hook_record,
+        "Stop recording VMM allocation events");
+
+  m.def("is_hook_recording", &::foundry::is_hook_recording,
+        "Check if VMM allocation event recording is active");
+
+  m.def("clear_hook_events", &::foundry::clear_hook_events,
+        "Clear recorded VMM allocation events");
+
   m.def(
       "pack_fatbins_to_folder",
       [](const std::string& folder_path) { ::foundry::pack_fatbins_to_folder(folder_path); },

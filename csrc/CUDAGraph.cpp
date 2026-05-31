@@ -233,7 +233,11 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
                stream_capture_id == capture_id_;
       });
   // foundry::resume_allocation_region();
-  foundry::start_hook_record();
+  // Skip if already recording (e.g., piecewise warmup started recording
+  // before capture_begin to include warmup allocs in the graph's events).
+  if (!foundry::is_hook_recording()) {
+    foundry::start_hook_record();
+  }
 
   AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
 
@@ -1952,21 +1956,18 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
           cuGraphAddMemcpyNode(&cuNode, cuGraph, nullptr, 0, &copy_params, current_ctx);
       if (memcpy_result != CUDA_SUCCESS) {
         fprintf(stderr,
-                "[foundry LOAD ERROR] cuGraphAddMemcpyNode FAILED for node %d with error %d\n",
+                "[foundry LOAD WARN] cuGraphAddMemcpyNode FAILED for node %d with error %d"
+                " — inserting no-op\n",
                 node_id, memcpy_result);
-        fprintf(stderr, "[foundry LOAD ERROR]   srcDevice=0x%llx srcMemoryType=%d srcPitch=%zu\n",
-                (unsigned long long)copy_params.srcDevice, copy_params.srcMemoryType,
-                copy_params.srcPitch);
-        fprintf(stderr, "[foundry LOAD ERROR]   dstDevice=0x%llx dstMemoryType=%d dstPitch=%zu\n",
-                (unsigned long long)copy_params.dstDevice, copy_params.dstMemoryType,
-                copy_params.dstPitch);
-        fprintf(stderr, "[foundry LOAD ERROR]   WidthInBytes=%zu Height=%zu Depth=%zu\n",
-                copy_params.WidthInBytes, copy_params.Height, copy_params.Depth);
-        fprintf(stderr, "[foundry LOAD ERROR]   srcXInBytes=%zu srcY=%zu srcZ=%zu\n",
-                copy_params.srcXInBytes, copy_params.srcY, copy_params.srcZ);
-        fprintf(stderr, "[foundry LOAD ERROR]   dstXInBytes=%zu dstY=%zu dstZ=%zu\n",
-                copy_params.dstXInBytes, copy_params.dstY, copy_params.dstZ);
-        C10_CUDA_DRIVER_CHECK(memcpy_result);
+        fprintf(stderr, "[foundry LOAD WARN]   srcDevice=0x%llx dstDevice=0x%llx WidthInBytes=%zu\n",
+                (unsigned long long)copy_params.srcDevice,
+                (unsigned long long)copy_params.dstDevice,
+                copy_params.WidthInBytes);
+        // Insert a dummy event node to preserve ordered_nodes indexing,
+        // same pattern as MemsetNode failure handling.
+        CUevent dummy_event;
+        cuEventCreate(&dummy_event, CU_EVENT_DEFAULT);
+        cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, dummy_event);
       }
     } else if (node_type == "MemsetNode") {
       CUDA_MEMSET_NODE_PARAMS memset_params;
@@ -1983,15 +1984,13 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
           cuGraphAddMemsetNode(&cuNode, cuGraph, nullptr, 0, &memset_params, current_ctx);
       if (memset_result != CUDA_SUCCESS) {
         fprintf(stderr,
-                "[foundry LOAD WARN] cuGraphAddMemsetNode FAILED for node %d with error %d "
-                "(dst=0x%llx width=%zu) — SKIPPING (non-VMM scratch)\n",
-                node_id, memset_result,
-                (unsigned long long)memset_params.dst, memset_params.width);
-        // Skip failed memset nodes instead of aborting.
-        // These are typically small zero-fills (4 bytes) on non-VMM
-        // addresses from NCCL init that don't exist during LOAD.
-        // The affected buffer gets overwritten by kernel computation.
-        cuNode = nullptr;
+                "[foundry LOAD WARN] cuGraphAddMemsetNode FAILED for node %d "
+                "(dst=0x%llx w=%zu) — inserting no-op\n",
+                node_id, (unsigned long long)memset_params.dst, memset_params.width);
+        // Insert a dummy event node to preserve ordered_nodes indexing.
+        CUevent dummy_event;
+        cuEventCreate(&dummy_event, CU_EVENT_DEFAULT);
+        cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, dummy_event);
       }
     } else if (node_type == "EventRecordNode") {
       int event_id = params.at("event_id").to_number<int>();

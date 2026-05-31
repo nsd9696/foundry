@@ -1514,6 +1514,83 @@ static void setup_handles_for_library(CUlibrary library, uint64_t hash,
   binary_hash_to_handles.insert_or_assign(hash, std::make_tuple(library, kernel_map));
 }
 
+// Register a runtime-loaded module's function handles for name-based fallback
+// lookup in query_function_handle. Used by the skip_fatbin_processing path
+// (EP piecewise LOAD) where torch.compile kernels have different binary hashes
+// between SAVE and LOAD. Unlike setup_handles_for_module, this does not
+// validate against expected names and gracefully handles failures.
+static void register_runtime_module_handles(CUmodule module, uint64_t hash) {
+  typedef CUresult (*cuModuleGetFunctionCount_t)(unsigned int*, CUmodule);
+  typedef CUresult (*cuModuleEnumerateFunctions_t)(CUfunction*, unsigned int, CUmodule);
+  typedef CUresult (*cuFuncGetName_t)(const char**, CUfunction);
+
+  auto get_count_func = (cuModuleGetFunctionCount_t)CUDA_DRIVER_CALL(
+      cuda_driver_entry_table, CUDA_ENTRY_cuModuleGetFunctionCount);
+  auto enum_func = (cuModuleEnumerateFunctions_t)CUDA_DRIVER_CALL(
+      cuda_driver_entry_table, CUDA_ENTRY_cuModuleEnumerateFunctions);
+  auto get_name_func =
+      (cuFuncGetName_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuFuncGetName);
+
+  unsigned int func_count = 0;
+  if (get_count_func(&func_count, module) != CUDA_SUCCESS || func_count == 0)
+    return;
+
+  std::vector<CUfunction> functions(func_count);
+  if (enum_func(functions.data(), func_count, module) != CUDA_SUCCESS)
+    return;
+
+  std::unordered_map<std::string, CUfunction> func_map;
+  for (const auto& function : functions) {
+    const char* name = nullptr;
+    if (get_name_func(&name, function) == CUDA_SUCCESS && name)
+      func_map[name] = function;
+  }
+
+  if (!func_map.empty()) {
+    binary_hash_to_handles.insert_or_assign(hash, ModuleHandles{module, func_map});
+#ifdef HOOK_DEBUG
+    fprintf(stderr, "[HOOK] DEBUG: Registered %zu runtime module functions for hash %016llx\n",
+            func_map.size(), (unsigned long long)hash);
+#endif
+  }
+}
+
+static void register_runtime_library_handles(CUlibrary library, uint64_t hash) {
+  typedef CUresult (*cuLibraryGetKernelCount_t)(unsigned int*, CUlibrary);
+  typedef CUresult (*cuLibraryEnumerateKernels_t)(CUkernel*, unsigned int, CUlibrary);
+  typedef CUresult (*cuKernelGetName_t)(const char**, CUkernel);
+
+  auto get_count_func = (cuLibraryGetKernelCount_t)CUDA_DRIVER_CALL(
+      cuda_driver_entry_table, CUDA_ENTRY_cuLibraryGetKernelCount);
+  auto enum_func = (cuLibraryEnumerateKernels_t)CUDA_DRIVER_CALL(
+      cuda_driver_entry_table, CUDA_ENTRY_cuLibraryEnumerateKernels);
+  auto get_name_func =
+      (cuKernelGetName_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuKernelGetName);
+
+  unsigned int kernel_count = 0;
+  if (get_count_func(&kernel_count, library) != CUDA_SUCCESS || kernel_count == 0)
+    return;
+
+  std::vector<CUkernel> kernels(kernel_count);
+  if (enum_func(kernels.data(), kernel_count, library) != CUDA_SUCCESS)
+    return;
+
+  std::unordered_map<std::string, CUkernel> kernel_map;
+  for (const auto& kernel : kernels) {
+    const char* name = nullptr;
+    if (get_name_func(&name, kernel) == CUDA_SUCCESS && name)
+      kernel_map[name] = kernel;
+  }
+
+  if (!kernel_map.empty()) {
+    binary_hash_to_handles.insert_or_assign(hash, LibraryHandles{library, kernel_map});
+#ifdef HOOK_DEBUG
+    fprintf(stderr, "[HOOK] DEBUG: Registered %zu runtime library kernels for hash %016llx\n",
+            kernel_map.size(), (unsigned long long)hash);
+#endif
+  }
+}
+
 // Pre-link fatbin segments during SAVE mode to avoid runtime linking during LOAD
 static std::vector<uint8_t> prelink_fatbin_segments(
     const std::vector<std::vector<uint8_t>>& segments, const std::vector<CUjit_option>& jit_options,
@@ -1839,9 +1916,18 @@ CUresult cuModuleLoadData(CUmodule* module, const void* image) {
   auto real_func =
       (cuModuleLoadData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleLoadData);
 
-  // Skip heavy processing in LOAD mode for faster startup
+  // Skip heavy fatbin dump in LOAD mode but register function handles
+  // for name-based fallback lookup in query_function_handle.
   if (skip_fatbin_processing.load()) {
-    return real_func(module, image);
+    CUresult res = real_func(module, image);
+    if (res == CUDA_SUCCESS && module && *module) {
+      // Use module pointer as hash (avoids buffer overread on small JIT binaries;
+      // content hash not needed since LOAD uses name-based fallback).
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*module));
+      register_runtime_module_handles(*module, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*module, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -1878,9 +1964,14 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int nu
   auto real_func = (cuModuleLoadDataEx_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                           CUDA_ENTRY_cuModuleLoadDataEx);
 
-  // Skip heavy processing in LOAD mode for faster startup
   if (skip_fatbin_processing.load()) {
-    return real_func(module, image, numOptions, options, optionValues);
+    CUresult res = real_func(module, image, numOptions, options, optionValues);
+    if (res == CUDA_SUCCESS && module && *module) {
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*module));
+      register_runtime_module_handles(*module, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*module, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -1915,9 +2006,14 @@ CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
   auto real_func = (cuModuleLoadFatBinary_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                              CUDA_ENTRY_cuModuleLoadFatBinary);
 
-  // Skip heavy processing in LOAD mode for faster startup
   if (skip_fatbin_processing.load()) {
-    return real_func(module, fatCubin);
+    CUresult res = real_func(module, fatCubin);
+    if (res == CUDA_SUCCESS && module && *module) {
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*module));
+      register_runtime_module_handles(*module, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*module, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -1956,10 +2052,15 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
   auto real_func =
       (cuLibraryLoadData_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLibraryLoadData);
 
-  // Skip heavy processing in LOAD mode for faster startup
   if (skip_fatbin_processing.load()) {
-    return real_func(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
-                     libraryOptionValues, numLibraryOptions);
+    CUresult res = real_func(library, code, jitOptions, jitOptionsValues, numJitOptions,
+                             libraryOptions, libraryOptionValues, numLibraryOptions);
+    if (res == CUDA_SUCCESS && library && *library) {
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*library));
+      register_runtime_library_handles(*library, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*library, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -1995,9 +2096,15 @@ CUresult cuModuleLoad(CUmodule* module, const char* fname) {
   auto real_func =
       (cuModuleLoad_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuModuleLoad);
 
-  // Skip heavy processing in LOAD mode for faster startup
+  // Skip heavy processing in LOAD mode but register handles for fallback lookup
   if (skip_fatbin_processing.load()) {
-    return real_func(module, fname);
+    CUresult res = real_func(module, fname);
+    if (res == CUDA_SUCCESS && module && *module) {
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*module));
+      register_runtime_module_handles(*module, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*module, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -2036,10 +2143,16 @@ CUresult cuLibraryLoadFromFile(CUlibrary* library, const char* fileName, CUjit_o
   auto real_func = (cuLibraryLoadFromFile_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                              CUDA_ENTRY_cuLibraryLoadFromFile);
 
-  // Skip heavy processing in LOAD mode for faster startup
+  // Skip heavy processing in LOAD mode but register handles for fallback lookup
   if (skip_fatbin_processing.load()) {
-    return real_func(library, fileName, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
-                     libraryOptionValues, numLibraryOptions);
+    CUresult res = real_func(library, fileName, jitOptions, jitOptionsValues, numJitOptions,
+                             libraryOptions, libraryOptionValues, numLibraryOptions);
+    if (res == CUDA_SUCCESS && library && *library) {
+      uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*library));
+      register_runtime_library_handles(*library, hash);
+      module_or_library_handle_to_hash.insert_or_assign(*library, hash);
+    }
+    return res;
   }
 
   const int idx = dumped_binary_counter.fetch_add(1);
@@ -3399,8 +3512,6 @@ void set_current_alloc_offset(size_t offset) {
     return;
   }
 
-  // Ensure the new offset is not less than the current offset
-  // (we don't support moving backwards as it could corrupt existing allocations)
   if (new_alloc_addr < tls_storage.current_alloc_base_addr) {
     fprintf(stderr,
             "[HOOK] WARNING: New offset 0x%llx is less than current offset 0x%llx, skipping\n",
@@ -3430,6 +3541,10 @@ void start_hook_record() {
 
 void end_hook_record() {
   hook_recording_enabled.store(false);
+}
+
+bool is_hook_recording() {
+  return hook_recording_enabled.load();
 }
 
 void clear_hook_events() {
@@ -3475,20 +3590,13 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
     if (start_base_addr >= tls_storage.current_alloc_base_addr) {
       tls_storage.current_alloc_base_addr = static_cast<CUdeviceptr>(start_base_addr);
     } else {
-      // LOAD mode consumed more memory than SAVE mode before graph loading.
-      // This means allocations happened in a different order or additional allocations
-      // occurred that weren't present during SAVE.
       fprintf(stderr, "[HOOK] ERROR: Memory offset mismatch during replay\n");
-      fprintf(stderr, "[HOOK]   Current offset: 0x%llx (%.2f MB from base)\n",
+      fprintf(stderr, "[HOOK]   Current: 0x%llx (%.2f MB), Expected: 0x%llx (%.2f MB), Diff: %.2f MB\n",
               (unsigned long long)tls_storage.current_alloc_base_addr,
-              (tls_storage.current_alloc_base_addr - (size_t)tls_storage.region.base) /
-                  (1024.0 * 1024.0));
-      fprintf(stderr, "[HOOK]   Expected start: 0x%llx (%.2f MB from base)\n",
+              (tls_storage.current_alloc_base_addr - (size_t)tls_storage.region.base) / (1024.0 * 1024.0),
               (unsigned long long)start_base_addr,
-              (start_base_addr - (size_t)tls_storage.region.base) / (1024.0 * 1024.0));
-      fprintf(stderr, "[HOOK]   Difference: %.2f MB\n",
+              (start_base_addr - (size_t)tls_storage.region.base) / (1024.0 * 1024.0),
               (tls_storage.current_alloc_base_addr - start_base_addr) / (1024.0 * 1024.0));
-      fprintf(stderr, "[HOOK] HINT: Ensure LOAD mode has identical initialization as SAVE mode\n");
       abort();
     }
   }
@@ -3618,9 +3726,38 @@ std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
   });
 
   if (!found) {
-    fprintf(stderr, "[HOOK] ERROR: Binary hash %016llx not found\n",
-            (unsigned long long)binary_hash);
-    abort();
+    // Fallback: search ALL registered modules/libraries for the function name.
+    // This handles piecewise EP where torch.compile kernels have
+    // different binary hashes between SAVE and LOAD (JIT recompilation).
+    // The skip_fatbin_processing path registers runtime handles via
+    // register_runtime_module_handles / register_runtime_library_handles.
+    binary_hash_to_handles.cvisit_all([&](const auto& pair) {
+      if (found) return;
+      const auto& handles_variant = pair.second;
+      if (std::holds_alternative<ModuleHandles>(handles_variant)) {
+        const auto& [mod, func_map] = std::get<ModuleHandles>(handles_variant);
+        auto it = func_map.find(function_name);
+        if (it != func_map.end()) {
+          found = true;
+          result = it->second;
+        }
+      } else {
+        const auto& [lib, kernel_map] = std::get<LibraryHandles>(handles_variant);
+        auto it = kernel_map.find(function_name);
+        if (it != kernel_map.end()) {
+          found = true;
+          result = it->second;
+        }
+      }
+    });
+    if (found) {
+      fprintf(stderr, "[HOOK] INFO: Function %s resolved via name fallback (original hash %016llx)\n",
+              function_name.c_str(), (unsigned long long)binary_hash);
+    } else {
+      fprintf(stderr, "[HOOK] ERROR: Function %s not found in any module (hash %016llx)\n",
+              function_name.c_str(), (unsigned long long)binary_hash);
+      abort();
+    }
   }
 
   return result;

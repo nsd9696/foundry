@@ -45,6 +45,7 @@ class CUDAGraphExtensionState:
     capture_index: int = 0
     rank: int = 0
     loaded_graphs: dict = field(default_factory=dict)
+    loaded_piecewise_graphs: dict = field(default_factory=dict)
 
 
 _state: CUDAGraphExtensionState | None = None
@@ -131,7 +132,21 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         cge.set_skip_fatbin_processing(True)
         if not workspace_dir.exists():
             raise RuntimeError(f"Foundry workspace for rank {rank} does not exist: {workspace_dir}")
-        cge.load_cuda_modules_and_libraries(str(workspace_dir))
+        # Check if fatbin files exist and are non-empty
+        import os
+        fatbin_path = os.path.join(str(workspace_dir), "fatbin_image_packed.img")
+        entrypoint_path = os.path.join(str(workspace_dir), "fatbin_entrypoint_packed.txt")
+        has_fatbin = (
+            os.path.exists(fatbin_path) and os.path.getsize(fatbin_path) > 0
+            and os.path.exists(entrypoint_path) and os.path.getsize(entrypoint_path) > 0
+        )
+        if has_fatbin:
+            cge.load_cuda_modules_and_libraries(str(workspace_dir))
+        else:
+            # Piecewise EP: no fatbin (torch.compile manages kernels)
+            # Also disable fatbin processing to prevent hash check errors
+            cge.set_skip_fatbin_processing(True)
+            logger.info("[Foundry] Skipping fatbin load (empty/piecewise)")
 
     region_size = parse_size(cfg.region_size)
     cge.set_allocation_region(cfg.base_addr, region_size)
@@ -194,9 +209,16 @@ def preallocate_for_load_mode() -> None:
                 final = json.load(f).get("final_alloc_offset", 0)
     if final <= 0:
         final = load_warmup_state().final_alloc_offset
-    remaining = final - cge.get_current_alloc_offset()
+    current = cge.get_current_alloc_offset()
+    remaining = final - current
+    logger.info(
+        "[Foundry] preallocate_for_load_mode: final=%d current=%d remaining=%d (%.2f MB)",
+        final, current, remaining, remaining / (1024 * 1024) if remaining > 0 else 0,
+    )
     if remaining > 0:
         cge.preallocate_region(remaining)
+        after = cge.get_current_alloc_offset()
+        logger.info("[Foundry] preallocate_for_load_mode: after=%d (advanced %d)", after, after - current)
 
 
 def log_alloc_offset(label: str) -> None:
