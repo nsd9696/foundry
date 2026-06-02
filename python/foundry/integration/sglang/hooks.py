@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 
 
+def _ep_lazy_init_needed() -> bool:
+    """True when the DeepEP all-to-all backend is active, so pre-capture lazy
+    init (NVSHMEM buffer, DeepGEMM JIT) must be warmed up outside stream capture."""
+    try:
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        return get_moe_a2a_backend().is_deepep()
+    except Exception:
+        return False
+
+
 def _resolve_dp_rank(model_runner) -> int | None:
     dp_rank = getattr(model_runner, "dp_rank", None)
     if dp_rank is not None:
@@ -31,7 +42,10 @@ def _resolve_dp_rank(model_runner) -> int | None:
     if getattr(server_args, "enable_dp_attention", False):
         from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 
-        _, _, dp_rank = compute_dp_attention_world_info(
+        # Returns (attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size) — a
+        # 4-tuple. Take attn_dp_rank (3rd) and discard the rest. (Unpacking into
+        # 3 targets would raise ValueError.)
+        _, _, dp_rank, _ = compute_dp_attention_world_info(
             server_args.enable_dp_attention,
             model_runner.tp_rank,
             server_args.tp_size,
@@ -105,8 +119,10 @@ def _patch_init_torch_distributed() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
 
-        import torch
-        torch.cuda.set_device(self.tp_rank)
+        # Bind this rank's CUDA device BEFORE reserving the VMM region.
+        if self.device == "cuda":
+            import torch
+            torch.get_device_module(self.device).set_device(self.gpu_id)
 
         rt.setup_graph_extension(
             self.server_args,
@@ -293,9 +309,19 @@ def _patch_cuda_graph_capture() -> None:
     orig_capture_graph = cls._capture_graph
     orig_capture_one_batch_size = cls.capture_one_batch_size
 
+    # When set, the capture machinery is being reused as a foundry-driven WARMUP
+    # pass: run a real forward per bs (no graph capture, no save) to trigger all
+    # of sglang's pre-capture lazy init — DeepEP buffer, DeepGEMM per-shape JIT,
+    # etc. — that would otherwise fire inside the captured stream and abort with
+    # "operation not permitted when stream is capturing". See `_run_warmup_pass`.
+    warmup_active = [False]
+
     @functools.wraps(orig_create_device_graph)
     def patched_create_device_graph(self, *args, **kwargs):
         mode = get_graph_extension_mode()
+        if warmup_active[0]:
+            # Throwaway graph object; the warmup never captures into it.
+            return orig_create_device_graph(self, *args, **kwargs)
         if mode == CUDAGraphExtensionMode.SAVE:
             from foundry.integration.sglang.graph_ops import create_device_graph
 
@@ -305,6 +331,10 @@ def _patch_cuda_graph_capture() -> None:
     @functools.wraps(orig_capture_graph)
     def patched_capture_graph(self, graph, pool, stream, run_once_fn):
         mode = get_graph_extension_mode()
+        if warmup_active[0]:
+            # Warmup: run the forward eagerly (NO torch.cuda.graph), so DeepGEMM
+            # JIT compile / NVSHMEM buffer creation happen outside stream capture.
+            return run_once_fn()
         if mode == CUDAGraphExtensionMode.SAVE:
             from foundry.integration.sglang.graph_ops import capture_graph
 
@@ -314,6 +344,11 @@ def _patch_cuda_graph_capture() -> None:
     @functools.wraps(orig_capture_one_batch_size)
     def patched_capture_one_batch_size(self, bs, forward, stream_idx=None):
         mode = get_graph_extension_mode()
+        if warmup_active[0]:
+            # Warmup pass: run upstream unchanged (real warmup forwards + a
+            # neutered "capture" that is just another real forward). No
+            # suppression, no save_graph.
+            return orig_capture_one_batch_size(self, bs, forward, stream_idx)
         if mode == CUDAGraphExtensionMode.SAVE:
             # Set DeepGEMM capture flag for sync no-op
             try:
@@ -361,9 +396,62 @@ def _patch_cuda_graph_capture() -> None:
             save_graph(graph, output, key)
         return graph, output
 
+    def _run_warmup_pass(self):
+        """Foundry-driven pre-capture warmup for the DeepEP/EP path.
+
+        Reuses the upstream capture loop with graph capture neutered (see
+        ``warmup_active``) to run one real forward per ``capture_bs`` BEFORE the
+        real capture/replay work — triggering every pre-capture lazy init sglang
+        normally does in its (foundry-suppressed) warmup forwards: DeepEP buffer
+        creation, DeepGEMM per-shape JIT compile, etc. Run on BOTH SAVE and LOAD
+        so the VMM cursor trajectory stays symmetric. ``self.graphs`` /
+        ``self.output_buffers`` are saved/cleared/restored so the throwaway
+        warmup entries don't leak into the real pass.
+        """
+        warmup_active[0] = True
+        saved_graphs, saved_buffers = self.graphs, self.output_buffers
+        self.graphs, self.output_buffers = {}, {}
+        t0 = time.perf_counter()
+        try:
+            orig_capture(self)
+        finally:
+            warmup_active[0] = False
+            self.graphs, self.output_buffers = saved_graphs, saved_buffers
+        logger.info(
+            "[Foundry] SGLang EP warmup pass (lazy-init) completed in %.3fs",
+            time.perf_counter() - t0,
+        )
+
     @functools.wraps(orig_capture)
     def patched(self, *args, **kwargs):
         mode = get_graph_extension_mode()
+
+        # DeepEP/EP only (gated so the validated dense / single-GPU / DP paths
+        # are untouched):
+        #   SAVE: sglang triggers pre-capture lazy init (DeepGEMM per-shape JIT,
+        #     DeepEP buffer, ...) via warmup forwards that foundry suppresses;
+        #     left lazy they fire inside the captured stream and abort
+        #     ("operation not permitted when stream is capturing"). Run a real
+        #     forward per bs up front so all that happens outside capture.
+        #   LOAD: no capture happens — preallocate_for_load_mode reserves the
+        #     whole region up to final_alloc_offset and replay places each alloc
+        #     at its recorded absolute offset, so LOAD need NOT replay the warmup
+        #     cursor trajectory. Running the warmup here is not just unnecessary
+        #     but harmful: its orig_capture re-enters graph_capture() and leaves
+        #     the context in a state that breaks the threaded finish_graph_loads
+        #     ("invalid device context"). So warmup is SAVE-only.
+        # bootstrap_deepep_buffer runs on both (cheap singleton) to guarantee the
+        # NVSHMEM runtime is up before replay on LOAD / before capture on SAVE.
+        if _ep_lazy_init_needed():
+            if mode == CUDAGraphExtensionMode.SAVE:
+                _run_warmup_pass(self)
+            if mode != CUDAGraphExtensionMode.NONE:
+                from foundry.integration.sglang.graph_ops import (
+                    bootstrap_deepep_buffer,
+                )
+
+                bootstrap_deepep_buffer(self)
+
         if mode == CUDAGraphExtensionMode.LOAD:
             from sglang.srt.distributed.device_communicators.pynccl_allocator import (
                 set_graph_pool_id,
@@ -388,7 +476,10 @@ def _patch_cuda_graph_capture() -> None:
             rt.log_alloc_offset("after_preallocate")
             # Pre-pass: allocate every per-bs FlashInfer wrapper in
             # ``reversed(capture_bs)`` order, matching the order SAVE used.
-            initialize_all_attention_metadata(self)
+            # FlashInfer-only pre-pass. fa3 etc. allocate their
+            # cuda-graph metadata once in init_cuda_graph_state, so skip it.
+            if hasattr(self.attn_backend, "indices_updater_decode"):
+                initialize_all_attention_metadata(self)
             rt.log_alloc_offset("after_pre_init")
             # Single ``start_graph_builds(all_paths)`` call so templates
             # and on-demand graphs link via ``shared_exec`` in the
@@ -398,6 +489,12 @@ def _patch_cuda_graph_capture() -> None:
             rt.log_alloc_offset("after_load_all_graphs")
             self.graphs = {k: v[0] for k, v in state.loaded_graphs.items()}
             self.output_buffers = {k: v[1] for k, v in state.loaded_graphs.items()}
+            # Non-FlashInfer backends: populate per-bs decode metadata after graph load.
+            if not hasattr(self.attn_backend, "indices_updater_decode"):
+                initialize_all_attention_metadata(self)
+            # Initialize the DeepEP cuda-graph adapter's captured mode.
+            if hasattr(self, "deepep_adapter"):
+                self.deepep_adapter.capture(is_extend_in_batch=False)
 
             # Post-load: stop VMM (vLLM pattern)
             from foundry.allocation_region import stop_allocation_region
@@ -406,18 +503,10 @@ def _patch_cuda_graph_capture() -> None:
             return None
 
         if mode == CUDAGraphExtensionMode.SAVE:
-            from foundry.integration.sglang.graph_ops import (
-                initialize_all_attention_metadata,
-            )
-
-            rt.log_alloc_offset("save_before_pre_init")
-
-            initialize_all_attention_metadata(self)
-            rt.log_alloc_offset("save_after_pre_init")
-
+            # FlashInfer pre-pass: allocate per-bs metadata wrappers up front.
+            # fa3 etc. use a single fixed workspace — skip for those.
             attn_backend = self.attn_backend
-            attn_backend.forward_metadata = None
-
+            use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
             real_init = attn_backend.init_forward_metadata_capture_cuda_graph
 
             def reuse_pre_pass_init(
@@ -519,7 +608,20 @@ def _patch_cuda_graph_capture() -> None:
                     spec_info,
                 )
 
-            attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
+            if use_fi_prepass:
+                from foundry.integration.sglang.graph_ops import (
+                    initialize_all_attention_metadata,
+                )
+
+                rt.log_alloc_offset("save_before_pre_init")
+                # Pre-pass: allocate every per-bs FlashInfer wrapper up front, in
+                # the same ``reversed(capture_bs)`` order LOAD uses.
+                initialize_all_attention_metadata(self)
+                rt.log_alloc_offset("save_after_pre_init")
+                # Drop the pre-pass's last forward_metadata ref so popping the dict
+                # entry doesn't keep the wrapper alive at refcount 1.
+                attn_backend.forward_metadata = None
+                attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
             try:
                 result = orig_capture(self, *args, **kwargs)
             finally:

@@ -1965,9 +1965,11 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
         on_demand_futures.push_back(
             pool.submit([&all_parsed, &graph_names, &bin_files, main_ctx, i]() {
-              // Push main CUDA context for driver calls in worker thread
-              // (cuFuncSetAttribute, cuEventCreate need valid context)
-              cuCtxSetCurrent(main_ctx);
+              // Bind the captured context on this pool worker thread. CUDA
+              // current-context is per-thread; without this the worker has no
+              // context and any driver call below fails with
+              // CUDA_ERROR_INVALID_CONTEXT.
+              C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
               if (bin_files[i].valid()) {
                 // Binary-native path: direct struct reads, no JSON
                 CUDAGraph::prepare_on_demand_graph_binary(bin_files[i], all_parsed[i].graph,
