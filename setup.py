@@ -144,4 +144,9 @@ ext_modules = [
 setup(
     cmdclass={"build_ext": CustomBuildExt},
     ext_modules=ext_modules,
+    entry_points={
+        "console_scripts": [
+            "foundry-serve=foundry.serve:main",
+        ],
+    },
 )

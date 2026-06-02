@@ -5,17 +5,11 @@ Wraps SGLang's launch_server with automatic SAVE/LOAD detection.
 No SGLang source modification required — patches ServerArgs at runtime.
 
 Usage:
-    FOUNDRY_CACHE=/data/graphs python -m foundry.serve [sglang args...]
-
-    # Or via shell wrapper:
     FOUNDRY_CACHE=/data/graphs foundry-serve --model MiniMaxAI/MiniMax-M2.7 --tp 4 --ep-size 4
 """
 import os
 import sys
 import tempfile
-import logging
-
-logger = logging.getLogger("foundry.serve")
 
 
 def _detect_mode(cache_dir):
@@ -36,31 +30,54 @@ scratch_space_size = "2GB"
     return path
 
 
+def _find_hook_library():
+    """Find libcuda_hook.so from the foundry package."""
+    try:
+        import foundry as _f
+        hook = os.path.join(os.path.dirname(_f.__file__), "libcuda_hook.so")
+        if os.path.exists(hook):
+            return hook
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_ld_preload():
+    """Re-exec with LD_PRELOAD if hook library is not loaded."""
+    hook = _find_hook_library()
+    if hook is None:
+        return
+
+    current = os.environ.get("LD_PRELOAD", "")
+    if hook in current:
+        return  # Already loaded
+
+    # Set LD_PRELOAD and re-exec
+    os.environ["LD_PRELOAD"] = f"{hook}:{current}" if current else hook
+    os.environ["FOUNDRY_SPAWN_T0_NS"] = str(__import__("time").perf_counter_ns())
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def _patch_sglang(toml_path):
     """Monkey-patch SGLang to support Foundry without source modifications."""
-    import dataclasses
     import sglang.srt.server_args as sa
 
     ServerArgs = sa.ServerArgs
 
-    # 1. Add foundry_graph_extension_config_path field to dataclass
+    # Add foundry field if not present
     if not hasattr(ServerArgs, "foundry_graph_extension_config_path"):
-        # Add the field to the class
         ServerArgs.__annotations__["foundry_graph_extension_config_path"] = "str | None"
         ServerArgs.foundry_graph_extension_config_path = None
 
-    # 2. Patch __post_init__ to inject foundry config + hooks
+    # Patch __post_init__
     orig_post_init = ServerArgs.__post_init__
 
     def _patched_post_init(self):
-        # Set foundry config path if not already set
         if not getattr(self, "foundry_graph_extension_config_path", None):
             self.foundry_graph_extension_config_path = toml_path
 
-        # Call original __post_init__
         orig_post_init(self)
 
-        # Install foundry hooks (equivalent to foundry_shim.apply_server_args)
         cfg_path = getattr(self, "foundry_graph_extension_config_path", None)
         if cfg_path:
             ep_size = getattr(self, "ep_size", 1)
@@ -73,31 +90,32 @@ def _patch_sglang(toml_path):
 
     ServerArgs.__post_init__ = _patched_post_init
 
-    # 3. Setup LD_PRELOAD for hook library
-    from foundry.integration.sglang.runtime import setup_ld_preload_env
-    setup_ld_preload_env()
-
 
 def main():
     cache_dir = os.environ.get("FOUNDRY_CACHE")
     if not cache_dir:
         print("Error: Set FOUNDRY_CACHE environment variable", file=sys.stderr)
-        print("Usage: FOUNDRY_CACHE=/data/graphs python -m foundry.serve [sglang args...]", file=sys.stderr)
+        print("Usage: FOUNDRY_CACHE=/data/graphs foundry-serve [sglang args...]",
+              file=sys.stderr)
         sys.exit(1)
 
+    # Step 1: Ensure LD_PRELOAD (re-execs if needed)
+    _ensure_ld_preload()
+
+    # Step 2: Auto-detect SAVE/LOAD
     os.makedirs(cache_dir, exist_ok=True)
     mode = _detect_mode(cache_dir)
     toml_path = _make_toml(mode, cache_dir)
 
     print(f"[foundry-serve] mode={mode} cache={cache_dir}", file=sys.stderr)
 
-    # Patch SGLang BEFORE it processes args
-    _patch_sglang(toml_path)
-
-    # Set FOUNDRY_MODE env for hook library
+    # Step 3: Set env vars for hook library
     os.environ["FOUNDRY_MODE"] = mode
 
-    # Run SGLang's launch_server as if called from command line
+    # Step 4: Patch SGLang
+    _patch_sglang(toml_path)
+
+    # Step 5: Run SGLang
     import runpy
     sys.argv[0] = "sglang.launch_server"
     runpy.run_module("sglang.launch_server", run_name="__main__")
