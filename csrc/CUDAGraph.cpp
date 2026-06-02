@@ -107,6 +107,7 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorState::replay_prologue(
 
 #endif  // TORCH_VERSION_MINOR < 12
 
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
 __attribute__((visibility("hidden"))) void CUDAGeneratorImpl::register_graph(
     cuda::CUDAGraph* graph) {
   auto foundry_graph = reinterpret_cast<foundry::CUDAGraph*>(graph);
@@ -118,6 +119,7 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorImpl::unregister_graph(
     cuda::CUDAGraph* graph) {
   state_->unregister_graph(graph);
 }
+#endif  // TORCH_VERSION_MINOR < 12
 
 #pragma GCC diagnostic pop
 }  // namespace at
@@ -191,14 +193,18 @@ void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorSta
 }
 
 void CUDAGraph::register_generator_state(const at::Generator& generator) {
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   c10::intrusive_ptr<at::CUDAGeneratorImpl> cuda_gen =
       c10::dynamic_intrusive_pointer_cast<at::CUDAGeneratorImpl>(generator.getIntrusivePtr());
   cuda_gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
+#endif
 }
 
 void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
                                          uint64_t wholegraph_increment) {
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
+#endif
   captured_generator_states_[state] = wholegraph_increment;
 }
 
@@ -207,6 +213,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
               "This CUDAGraph instance already owns a captured graph. "
               "To capture a new graph, create a new instance.");
 
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   auto* gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
   gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
@@ -214,6 +221,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->capture_prologue();
   }
+#endif
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -271,9 +279,11 @@ void CUDAGraph::capture_end() {
 
   TORCH_CHECK(graph_ != nullptr, "Invalid capture.");
 
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     wholegraph_increments = generator_state->capture_epilogue();
   }
+#endif
 
   size_t numCUDAGraphNodes = 0;
   AT_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &numCUDAGraphNodes));
@@ -480,9 +490,11 @@ void CUDAGraph::replay() {
     }
 
     c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
       generator_state->replay_prologue(wholegraph_increments);
     }
+#endif
 #ifdef FOUNDRY_DEBUG_REPLAY
     fprintf(stderr, "[foundry DEBUG] graph %d: launching on stream %p...\n",
             on_demand_data_->graph_id, (void*)at::cuda::getCurrentCUDAStream().stream());
@@ -509,9 +521,11 @@ void CUDAGraph::replay() {
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->replay_prologue(wholegraph_increments);
   }
+#endif
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
 
   int version = 0;
@@ -627,9 +641,11 @@ MempoolId_t CUDAGraph::pool() {
 }
 
 CUDAGraph::~CUDAGraph() {
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
     generator_state->unregister_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
   }
+#endif
   reset();
 
 #if (defined(USE_ROCM) && ROCM_VERSION >= 60200)
