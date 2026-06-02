@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/Functions.h>
+#include <torch/version.h>
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/CUDAContext.h>
 #if __has_include(<ATen/cuda/MemPool.h>)
@@ -151,7 +152,9 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
       uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
       auto state = registry.get_state_from_id(state_id, seed);
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
       state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
+#endif
       graph->captured_generator_states_[state] = wholegraph_increment;
     }
   }

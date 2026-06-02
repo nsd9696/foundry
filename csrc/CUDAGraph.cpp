@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
+#include <torch/version.h>
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 
