@@ -17,7 +17,7 @@ def get_boost_paths():
 
     cmake_script = cmake_query_dir / "CMakeLists.txt"
     cmake_script.write_text("""
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.18)
 project(boost_query LANGUAGES CXX)
 find_package(Boost 1.83.0 CONFIG REQUIRED COMPONENTS filesystem json)
 
