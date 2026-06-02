@@ -32,6 +32,12 @@ namespace at {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
 
+// PyTorch 2.12+ refactored CUDAGeneratorState (multi-capture support).
+// The private members (capturing_, offset_intragraph_, registered_graphs_,
+// seed_extragraph_, offset_extragraph_) moved into CUDAGeneratorCaptureState.
+// These overrides are only needed for PyTorch ≤ 2.11.
+#if !defined(TORCH_VERSION_MINOR) || TORCH_VERSION_MINOR < 12
+
 __attribute__((visibility("hidden"))) void CUDAGeneratorState::register_graph(
     cuda::CUDAGraph* graph) {
   at::cuda::assertNotCapturing("Cannot register the state during capturing stage.");
@@ -97,6 +103,8 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorState::replay_prologue(
     increase(wholegraph_increment);
   }
 }
+
+#endif  // TORCH_VERSION_MINOR < 12
 
 __attribute__((visibility("hidden"))) void CUDAGeneratorImpl::register_graph(
     cuda::CUDAGraph* graph) {
