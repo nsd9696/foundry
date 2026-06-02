@@ -747,71 +747,63 @@ def _load_piecewise_graphs_skip_compile(model_runner) -> None:
         time.perf_counter() - t0,
     )
 
+    # Validate: at least some graphs loaded
+    if len(loaded) == 0:
+        raise RuntimeError(
+            "[Foundry] All piecewise graphs failed to load. "
+            "Delete the cache and re-run SAVE."
+        )
+
+    # Track which batch sizes have loaded graphs
+    _loaded_batch_sizes = frozenset(
+        int(key.split("_")[2]) for key in loaded if key.split("_")[1] == "0"
+    )
+
     # Use existing runner if available, or create a stub
     runner = getattr(model_runner, "piecewise_cuda_graph_runner", None)
     if runner is None:
-        # torch.compile was skipped — create minimal stub for can_run
+        # torch.compile was skipped — stub that always defers to eager path.
+        # SGLang's eager path calls model.forward → our _replay_forward.
         class _StubRunner:
-            max_num_tokens = max(batch_sizes) if batch_sizes else 0
-            capture_num_tokens = sorted(batch_sizes)
+            max_num_tokens = max(_loaded_batch_sizes) if _loaded_batch_sizes else 0
+            capture_num_tokens = sorted(_loaded_batch_sizes)
             def can_run(self, forward_batch):
-                return len(forward_batch.input_ids) <= self.max_num_tokens
-            def replay(self, forward_batch, **kwargs):
-                pass  # Handled by _replay_forward
+                # Always False: forces SGLang to use eager path,
+                # which calls model.forward → _replay_forward.
+                # This avoids needing replay_prepare/buffers/etc.
+                return False
         runner = _StubRunner()
         model_runner.piecewise_cuda_graph_runner = runner
+    else:
+        # Real runner exists — patch can_run to only accept loaded sizes
+        def _patched_can_run(self, forward_batch):
+            num_tokens = len(forward_batch.input_ids)
+            return num_tokens in _loaded_batch_sizes and num_tokens <= self.max_num_tokens
+        runner.can_run = _patched_can_run.__get__(runner)
 
     # Install replay wrapper on model.forward
     original_forward = model_runner.model.forward
-
-    _replay_first_call = [True]
-
-    # Track which batch sizes have loaded graphs for can_run check
-    _loaded_batch_sizes = set()
-    for key in loaded:
-        parts = key.split("_")
-        if parts[1] == "0":  # segment 0 = first segment
-            _loaded_batch_sizes.add(int(parts[2]))
-
-    # Override can_run to reject batch sizes without loaded graphs
-    # Override can_run: only allow batch sizes that have loaded graphs
-    def _patched_can_run(self, forward_batch):
-        num_tokens = len(forward_batch.input_ids)
-        return num_tokens in _loaded_batch_sizes and num_tokens <= self.max_num_tokens
-
-    runner.can_run = _patched_can_run.__get__(runner)
 
     def _replay_forward(input_ids, positions, forward_batch, **kwargs):
         num_tokens = input_ids.shape[0]
         first_key = f"pw_0_{num_tokens}"
         if first_key in loaded:
-            if _replay_first_call[0]:
-                _replay_first_call[0] = False
-                from foundry import ops as _cge
-                logger.info("[Foundry] First piecewise replay: num_tokens=%d cursor=%d",
-                            num_tokens, _cge.get_current_alloc_offset())
             import torch
-            # Try with the MATCHING batch size's graphs
-            # If current num_tokens doesn't have alloc events,
-            # try using the largest batch's graph instead for debug
             for seg_idx in range(num_segments):
                 key = f"pw_{seg_idx}_{num_tokens}"
                 if key in loaded:
-                    try:
-                        torch.cuda.synchronize()
-                        loaded[key][0].replay()
-                        torch.cuda.synchronize()
-                    except Exception as e:
-                        logger.error("[Foundry] replay FAILED seg %d/%d key=%s: %s",
-                                     seg_idx, num_segments, key, e)
-                        raise
+                    loaded[key][0].replay()
             last_key = f"pw_{num_segments - 1}_{num_tokens}"
             return loaded[last_key][1]
+        # Batch size not in loaded graphs (e.g., server warmup with
+        # non-standard size). Safe to use eager forward since torch.compile
+        # is not installed (no capture attempt after VMM stop).
         return original_forward(input_ids, positions, forward_batch, **kwargs)
 
     model_runner.model.forward = _replay_forward
     model_runner.piecewise_cuda_graph_runner = runner
-    logger.info("[Foundry] Installed piecewise replay wrapper on model.forward")
+    logger.info("[Foundry] Installed piecewise replay wrapper (%d sizes, %d segments)",
+                len(_loaded_batch_sizes), num_segments)
 
 
 def _patch_init_device_graphs_ep() -> None:
